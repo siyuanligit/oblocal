@@ -78,7 +78,7 @@ async function backfillPendingEmbeddings(pgPool, ollamaUrl) {
         'UPDATE thoughts SET embedding = $1, needs_embedding = false WHERE id = $2',
         [embedding, row.id]
       );
-    } catch {
+    } catch (err) {
       // Leave needs_embedding = true, will retry on next tool call
       console.error(`[backfill] Failed embedding for thought ${row.id}: ${err.message}`);
     }
