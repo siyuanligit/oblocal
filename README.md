@@ -2,6 +2,8 @@
 
 Zero cloud services. Your own PostgreSQL + pgvector database running in Docker on your machine. Your AI coding agents connect via stdio — no API keys, no external calls.
 
+> **Original project:** [OB1 by NateBJones](https://github.com/NateBJones-Projects/OB1) — This is a local-first fork that replaces Supabase/OpenRouter dependencies with Docker + Ollama running entirely on your machine.
+
 ---
 
 ![Step 1](https://img.shields.io/badge/Step_1-Install_Docker-1E88E5?style=for-the-badge)
