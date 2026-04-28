@@ -34,6 +34,7 @@ async function getEmbedding(text, ollamaUrl) {
 }
 
 async function extractMetadata(text, ollamaUrl, chatModel) {
+  const safeText = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
   try {
     const response = await fetch(`${ollamaUrl}/api/chat`, {
       method: "POST",
@@ -51,12 +52,16 @@ async function extractMetadata(text, ollamaUrl, chatModel) {
 - "topics": array of 1-3 short topic tags (always at least one)
 - "type": one of "observation", "task", "idea", "reference", "person_note"
 Only extract what's explicitly there.`
-        }, { role: "user", content: text }]
+        }, { role: "user", content: safeText }]
       })
     });
     if (!response.ok) throw new Error(`Metadata extraction failed: ${response.status}`);
     const data = await response.json();
-    return JSON.parse(data.message.content);
+    try {
+      return JSON.parse(data.message.content);
+    } catch {
+      return { topics: ["uncategorized"], type: "observation" };
+    }
   } catch {
     return { topics: ["uncategorized"], type: "observation" };
   }
@@ -75,6 +80,7 @@ async function backfillPendingEmbeddings(pgPool, ollamaUrl) {
       );
     } catch {
       // Leave needs_embedding = true, will retry on next tool call
+      console.error(`[backfill] Failed embedding for thought ${row.id}: ${err.message}`);
     }
   }
 }

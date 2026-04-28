@@ -53,6 +53,7 @@ async function checkOllamaModel(ollamaUrl, model) {
 }
 
 async function extractMetadata(text, ollamaUrl, chatModel = 'llama3.2-mini') {
+  const safeText = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
   try {
     const response = await fetch(`${ollamaUrl}/api/chat`, {
       method: 'POST',
@@ -70,12 +71,16 @@ async function extractMetadata(text, ollamaUrl, chatModel = 'llama3.2-mini') {
 - "topics": array of 1-3 short topic tags (always at least one)
 - "type": one of "observation", "task", "idea", "reference", "person_note"
 Only extract what's explicitly there.`
-        }, { role: 'user', content: text }]
+        }, { role: 'user', content: safeText }]
       })
     });
     if (!response.ok) throw new Error(`Metadata extraction failed: ${response.status}`);
     const data = await response.json();
-    return JSON.parse(data.message.content);
+    try {
+      return JSON.parse(data.message.content);
+    } catch {
+      return { topics: ['uncategorized'], type: 'observation' };
+    }
   } catch {
     return { topics: ['uncategorized'], type: 'observation' };
   }
@@ -120,8 +125,8 @@ async function backfill(opts) {
           [embedding, row.id]
         );
         backfilled++;
-      } catch {
-        // Leave needs_embedding = true, will retry next time
+      } catch (err) {
+        if (!opts.json) console.error(`  [backfill] Failed embedding for thought ${row.id}: ${err.message}`);
       }
     }
 
@@ -149,50 +154,70 @@ async function capture(text, opts) {
     return 1;
   }
 
+  const MAX_CONTENT_LENGTH = 10000;
+  if (text.length > MAX_CONTENT_LENGTH) {
+    if (opts.json) outputJson({ error: `Content exceeds maximum length of ${MAX_CONTENT_LENGTH} characters` });
+    else console.error(`Error: Content exceeds maximum length of ${MAX_CONTENT_LENGTH} characters`);
+    return 1;
+  }
+
+  let pool = null;
   try {
-    const pool = new Pool({ connectionString: config.database_url });
-
-    const metadata = await extractMetadata(text, config.ollama_url, config.chat_model);
-
-    const fingerprint = await pool.query(
-      `SELECT encode(sha256(convert_to(lower(trim(regexp_replace($1, '\\s+', ' ', 'g'))), 'UTF8')), 'hex') as fp`,
-      [text]
-    );
-    const fp = fingerprint.rows[0].fp;
-
-    const upsert = await pool.query(
-      `INSERT INTO thoughts (content, content_fingerprint, metadata)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (content_fingerprint) WHERE content_fingerprint IS NOT NULL DO UPDATE
-       SET updated_at = now(),
-           metadata = thoughts.metadata || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
-       RETURNING id, created_at`,
-      [text, fp, JSON.stringify(metadata)]
-    );
-
-    const { id, created_at } = upsert.rows[0];
-
-    let embedded = false;
+    pool = new Pool({ connectionString: config.database_url });
+    const client = await pool.connect();
     try {
-      const embedding = await getEmbedding(text, config.ollama_url, config.embedding_model);
-      await pool.query('UPDATE thoughts SET embedding = $1, needs_embedding = false WHERE id = $2', [embedding, id]);
-      embedded = true;
-    } catch {
-      await pool.query('UPDATE thoughts SET needs_embedding = true WHERE id = $1 AND embedding IS NULL', [id]);
-    }
+      await client.query('BEGIN');
 
-    await pool.end();
+      const metadata = await extractMetadata(text, config.ollama_url, config.chat_model);
 
-    if (opts.json) {
-      outputJson({ id, content: text, created_at, embedded });
-    } else {
-      console.log(`Captured: "${text}" (${id})`);
+      const fpResult = await client.query(
+        `SELECT encode(sha256(convert_to(lower(trim(regexp_replace($1, '\\s+', ' ', 'g'))), 'UTF8')), 'hex') as fp`,
+        [text]
+      );
+      const fp = fpResult.rows[0].fp;
+
+      const upsert = await client.query(
+        `INSERT INTO thoughts (content, content_fingerprint, metadata)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (content_fingerprint) WHERE content_fingerprint IS NOT NULL DO UPDATE
+         SET updated_at = now(),
+             metadata = thoughts.metadata || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
+         RETURNING id, created_at`,
+        [text, fp, JSON.stringify(metadata)]
+      );
+
+      const { id, created_at } = upsert.rows[0];
+
+      let embedded = false;
+      try {
+        const embedding = await getEmbedding(text, config.ollama_url, config.embedding_model);
+        await client.query('UPDATE thoughts SET embedding = $1, needs_embedding = false WHERE id = $2', [embedding, id]);
+        embedded = true;
+      } catch (err) {
+        if (!opts.json) console.error(`  [capture] Ollama unavailable, embedding staged: ${err.message}`);
+        await client.query('UPDATE thoughts SET needs_embedding = true WHERE id = $1 AND embedding IS NULL', [id]);
+      }
+
+      await client.query('COMMIT');
+
+      if (opts.json) {
+        outputJson({ id, content: text, created_at, embedded });
+      } else {
+        console.log(`Captured: "${text}" (${id})`);
+      }
+      return 0;
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
     }
-    return 0;
   } catch (err) {
     if (opts.json) outputJson({ error: err.message });
     else console.error(`Capture failed: ${err.message}`);
     return 1;
+  } finally {
+    if (pool) await pool.end();
   }
 }
 
@@ -434,6 +459,7 @@ async function init(opts) {
     console.log(`  ollama_url: ${defaultConfig.ollama_url}`);
     console.log(`  embedding_model: ${defaultConfig.embedding_model}`);
     console.log(`  chat_model: ${defaultConfig.chat_model}`);
+    console.log('\n  \u26a0\ufe0f  WARNING: Using default credentials. Change \'openbrain\' password for production use.');
   }
 
   saveConfig(defaultConfig);
