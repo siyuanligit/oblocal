@@ -2,12 +2,12 @@
 
 ## What We're Building
 
-A fully local Open Brain: your own PostgreSQL + pgvector database, with two ways to interact — **CLI** (direct terminal, no AI agent needed) or **MCP server** (connects coding agents like Claude Code, Cursor). No external APIs, no cloud services.
+A fully local Open Brain: your own PostgreSQL + pgvector database, with two interfaces — **CLI** and **MCP server**. Both expose the same 4 capabilities (capture, search, list, stats). No external APIs, no cloud services.
 
-**CLI is the primary interface.** You can use the CLI directly for all operations (capture, search, list, stats). The MCP server exists as an alternative for coding agents that prefer stdio transport. Both expose the same 4 capabilities.
+**CLI is the primary interface.** Humans use it directly in the terminal. Coding agents can also invoke it as a subprocess and parse `--json` output — this is the same interface, not a separate mechanism. The MCP server is an alternative for agents that prefer stdio transport.
 
-- **CLI** — runs on host machine. Direct terminal access. Preferred.
-- **MCP server** — runs in Docker, connects to coding agents via stdio transport. Alternative to CLI for AI-mediated access.
+- **CLI** — runs on host machine. Human operators use it directly. Agents invoke it as a subprocess, parse `--json` output. Same 4 capabilities.
+- **MCP server** — runs in Docker, connects to coding agents via stdio transport. Alternative interface for stdio-native agents.
 
 ---
 
@@ -18,8 +18,8 @@ A fully local Open Brain: your own PostgreSQL + pgvector database, with two ways
 | **Database** | PostgreSQL + pgvector in Docker. Native install instructions also provided. |
 | **Embedding** | Ollama `nomic-embed-text` (1536-dim) — runs locally, no external API calls |
 | **Metadata extraction** | Ollama `llama3.2-mini` (JSON mode) — configurable via `config.json` |
-| **CLI** | Primary interface — standalone, fully independent, same 4 capabilities as MCP |
-| **MCP server** | Alternative — always-on Docker container, stdio transport for coding agents |
+| **CLI** | Primary interface — standalone, fully independent. Humans use it directly; agents invoke it as a subprocess. Same 4 capabilities as MCP. |
+| **MCP server** | Alternative interface — always-on Docker container, stdio transport for agents that prefer MCP protocol. Same 4 capabilities as CLI. |
 | **Auth** | None — localhost-only, no external exposure |
 | **Config** | `~/.openbrain/config.json` — database_url, ollama_url, embedding_model, chat_model |
 | **Windows support** | Docker first-class — consistent across all platforms |
@@ -34,7 +34,8 @@ local-version/
 ├── docker-compose.yml          # postgres + pgvector + mcp (always-on)
 ├── Dockerfile.mcp               # Node.js MCP server image
 ├── scripts/
-│   └── mcp-wrapper.sh           # docker compose exec -i mcp (service name)
+│   ├── mcp-wrapper.sh           # docker compose exec -i mcp (service name) — MCP agents
+│   └── cli-wrapper.sh           # openbrain <cmd> --json — agents invoke CLI as subprocess
 ├── schema/
 │   ├── 001-thoughts.sql         # thoughts table + indexes + trigger
 │   ├── 002-match-thoughts.sql   # match_thoughts RPC
@@ -52,7 +53,7 @@ local-version/
 │   ├── 02-run-migrations.sh    # user-initiated SQL migrations
 │   ├── 03-setup-ollama.sh       # install Ollama + pull nomic-embed-text + llama3.2-mini
 │   ├── 04-setup-cli.sh          # npm install -g openbrain-cli
-│   └── 05-connect-agents.sh    # MCP agent integration guide
+│   └── 05-connect-agents.sh    # CLI + MCP integration guide (both interfaces)
 ├── README.md
 └── dev-plan.md
 ```
@@ -317,7 +318,7 @@ CMD ["node", "index.js"]
 
 ---
 
-## Phase 3: CLI Tool — DEPENDS ON: Phase 1 (independent of Phase 2)
+## Phase 3: CLI Tool + CLI Interface for Agents — DEPENDS ON: Phase 1 (independent of Phase 2)
 
 ### 3.1 `cli/package.json`
 
@@ -340,13 +341,20 @@ CMD ["node", "index.js"]
 | Command | Description | Exit Codes |
 |---|---|---|
 | `openbrain capture "text"` | Store thought with Ollama embedding | 0 success, 1 capture failed |
-| `openbrain search "query"` | Generate embedding via Ollama, run `match_thoughts` RPC directly — fully autonomous, no agent required | 0 success (even if no results), 1 search failed |
+| `openbrain search "query"` | Generate embedding via Ollama, run `match_thoughts` RPC directly | 0 success (even if no results), 1 search failed |
 | `openbrain list --limit 10` | List recent thoughts | 0 success, 1 db error |
 | `openbrain stats` | Show brain overview | 0 success, 1 db error |
 | `openbrain doctor` | Check Postgres, Ollama, config file connectivity | 0 all green, 1 one or more checks failed |
 | `openbrain init` | Create ~/.openbrain/config.json | 0 success, 1 already exists or write error |
 
-All commands support `--json` flag for machine-readable output ( scripting). Default output is plain text.
+All commands support `--json` flag for machine-readable output (scripting/agent use). Default output is plain text for human readability.
+
+The same commands work for both human operators and agents. Two additional commands are primarily useful for agents:
+
+| Command | Description | Exit Codes |
+|---|---|---|
+| `openbrain --manifest --json` | Output machine-readable tool descriptions (for agent discovery) | 0 always |
+| `openbrain --backfill --json` | Process up to 50 pending embeddings, return backfill report | 0 always |
 
 ### 3.3 CLI architecture
 
@@ -382,9 +390,397 @@ All commands support `--json` flag for machine-readable output ( scripting). Def
 4. Both models (`nomic-embed-text`, `llama3.2-mini`) are pulled
 5. **Fails fast** — exits non-zero on first failure, prints actionable message. Does not auto-fix.
 
+### 3.4 `scripts/cli-wrapper.sh` — CLI wrapper for agents
+
+Agents invoke `openbrain` as a subprocess. This wrapper resolves the `openbrain` binary from PATH (set by `npm install -g`) and handles cross-platform execution.
+
+```bash
+#!/bin/bash
+# Resolves openbrain from PATH set by npm install -g
+# Agents call: cli-wrapper.sh <command> --json [args]
+
+# Note: do NOT use `set -e` — openbrain search returns exit 1 when no results
+# are found, which is correct behavior, not an error.
+
+if ! command -v openbrain &> /dev/null; then
+  echo 'Error: openbrain not found in PATH. Run: npm install -g ./cli' >&2
+  exit 1
+fi
+
+exec openbrain "$@"
+```
+
+**Windows PowerShell fallback** (for agents running in PowerShell without WSL):
+```powershell
+# cli-wrapper.ps1
+$openbrain = Get-Command openbrain -ErrorAction SilentlyContinue
+if (-not $openbrain) {
+    Write-Error "openbrain not found in PATH. Run: npm install -g .\cli"
+    exit 1
+}
+& $openbrain $args
+exit $LASTEXITCODE
+```
+
+**Key design decisions:**
+- Wrapper is a thin shim — all logic lives in the CLI itself
+- No Docker involvement — agents run the CLI directly on the host
+- `chmod +x` required after clone: `chmod +x scripts/cli-wrapper.sh`
+
+### 3.5 CLI Interface for Agents — subprocess invocation pattern
+
+Coding agents that do not use MCP can invoke `openbrain` as a subprocess and parse `--json` output. This is a parallel path to MCP — agents choose based on their tooling.
+
+**When to use CLI vs MCP:**
+
+> **EUREKA:** The real distinction between CLI and MCP is not transport (subprocess vs stdio) — it is **discoverability + statefulness**. MCP servers can push `list_changed` notifications, support elicitation (server asks agent for clarification), and maintain session state. CLI is purely request-response with no server-initiated communication.
+
+- **CLI**: agents that manage their own subprocess lifecycle, prefer parsing structured JSON output, need one-shot operations, or manage their own state
+- **MCP**: stdio-native agents that need dynamic tool discovery, push notifications, or multi-step conversational interactions with the server initiating contact
+
+**Session initialization pattern:**
+Agents should call `openbrain doctor --json` at the start of every session to (a) verify connectivity and (b) confirm the CLI is available in PATH:
+
+```bash
+openbrain doctor --json
+# → { "passed": true, "checks": [...] }
+# → exit 0 if all green, exit 1 if any check failed
+```
+
+**Tool discovery:** Before invoking specific commands, agents can call `openbrain --manifest --json` to get a machine-readable description of all available tools:
+
+```bash
+openbrain --manifest --json
+# → { "tools": [{ "name": "capture", "description": "...", "inputSchema": {...} }, ...] }
+```
+
+**How agents invoke CLI:**
+```bash
+# Capture
+openbrain capture "thought text" --json
+# → stdout: { "id": "uuid", "content": "thought text", "created_at": "...", "embedded": true }
+# → exit 0
+
+# Search
+openbrain search "query" --json --limit 5 --threshold 0.75
+# → stdout: { "results": [{ "id": "...", "content": "...", "similarity": 0.82, ... }], "count": 2 }
+# → exit 0 (even if count is 0, count=0 is not an error)
+
+# List
+openbrain list --json --limit 10
+# → stdout: { "thoughts": [{ "id": "...", "content": "...", "created_at": "...", "needs_embedding": false }], "count": 5 }
+
+# Stats
+openbrain stats --json
+# → stdout: { "total_thoughts": 42, "pending_embeddings": 0, "top_types": [...], "top_topics": [...] }
+
+# Backfill (process pending embeddings)
+openbrain --backfill --json
+# → stdout: { "backfilled": 3, "remaining": 0 }
+# → exit 0 always (non-destructive)
+
+# Doctor (agent verification)
+openbrain doctor --json
+# → stdout: { "passed": true, "checks": [{ "name": "postgres", "passed": true, "message": "..." }] }
+# → exit 0 if all pass, exit 1 if any fail
+```
+
+**Agent integration example (pseudocode):**
+```javascript
+// 1. Session init — verify CLI is available
+const doctor = JSON.parse(await run('openbrain', ['doctor', '--json']));
+if (!doctor.passed) {
+  throw new Error('OpenBrain not available: ' + doctor.checks.filter(c => !c.passed).map(c => c.message).join(', '));
+}
+
+// 2. Optional: discover available tools
+const manifest = JSON.parse(await run('openbrain', ['--manifest', '--json']));
+
+// 3. Capture a thought
+const capture = JSON.parse(await run('openbrain', ['capture', 'Remember to refactor the auth module', '--json']));
+
+// 4. Search
+const search = JSON.parse(await run('openbrain', ['search', 'authentication', '--json', '--limit', '5']));
+for (const thought of search.results) {
+  console.log(`[${(thought.similarity * 100).toFixed(1)}%] ${thought.content}`);
+}
+
+// 5. Backfill if needed (process any pending embeddings from offline captures)
+const backfill = JSON.parse(await run('openbrain', ['--backfill', '--json']));
+```
+
+**Input escaping:** When passing user-supplied text as arguments, agents must escape or quote properly for the shell:
+```bash
+# Bash: use single quotes or escape double quotes inside the text
+openbrain capture 'User'"'"'s thought with "quotes"' --json
+# PowerShell: escape inner quotes with backtick
+openbrain capture "User`'s thought with `"quotes`"" --json
+```
+
+**Requirements for agents:**
+1. `openbrain` must be in PATH (run `npm install -g ./cli` first)
+2. Always use `--json` flag — agents parse stdout as JSON, never rely on text format
+3. Check exit codes — `0` = success, `1` = failure (but "no results found" is exit 1 with valid empty `results: []`)
+4. Call `openbrain doctor --json` at session start to verify connectivity
+5. Call `openbrain --backfill --json` to process any embeddings that staged while Ollama was unavailable
+
+**MCP backfill parity:** The MCP server runs `backfillPendingEmbeddings()` opportunistically on every tool call. The CLI does not auto-backfill — agents must explicitly call `openbrain --backfill --json` to process pending embeddings. This ensures agents control when backfill happens rather than having it trigger unexpectedly mid-session.
+
+### 3.6 `AGENTS.md` redesign — unified two-interface overview
+
+Replace the existing AGENTS.md content with a structure that opens with both interfaces as equal options, CLI prioritized. The MCP section becomes "MCP Interface" alongside "CLI Interface" — not a separate "MCP Agent Integration" silo.
+
+**New `AGENTS.md` structure:**
+
+```markdown
+# AGENTS.md — Open Brain Local
+
+## What This Is
+
+A local-first AI memory system: PostgreSQL + pgvector in Docker, with two interfaces — **CLI** and **MCP server**. Both expose the same 4 capabilities (capture, search, list, stats). No external APIs. Ollama runs locally.
+
+**CLI is the primary interface.** Use it directly in the terminal. Agents can also invoke it as a subprocess — same interface, no protocol overhead. The MCP server is an alternative for agents that prefer stdio transport.
+
+## Interfaces
+
+Open Brain exposes the same capabilities through two interfaces. Choose based on your tooling.
+
+> **Eureka:** The real distinction between CLI and MCP is not transport — it is **discoverability + statefulness**. MCP supports push notifications (`list_changed`), elicitation (server asks agent for input), and session state. CLI is purely request-response with no server-initiated communication. Choose MCP for conversational agent workflows; choose CLI for one-shot operations and agents that manage their own state.
+
+### CLI — primary interface
+
+`openbrain <command>` on the terminal. Also usable by agents as a subprocess.
+
+- **Human operators**: run directly in terminal
+- **Agents**: invoke as a subprocess, parse `--json` output
+- Both: same commands, same capabilities
+
+### MCP server — alternative interface
+
+`scripts/mcp-wrapper.sh` — stdio transport for coding agents.
+
+- **Agents that speak MCP natively**: Claude Code, Cursor, Windsurf, etc.
+- Configure once via `~/.claude/mcp.json`, agents connect automatically
+
+## Capabilities
+
+Both interfaces expose the same core capabilities:
+
+| Capability | CLI command | MCP tool |
+|---|---|---|
+| Store a thought | `openbrain capture "..."` | `capture_thought` |
+| Search memories | `openbrain search "..."` | `search_thoughts` |
+| List recent | `openbrain list --limit 10` | `list_thoughts` |
+| View stats | `openbrain stats` | `thought_stats` |
+| Discover tools | `openbrain --manifest --json` | (MCP tools/list via protocol) |
+| Backfill embeddings | `openbrain --backfill --json` | (auto on every call) |
+
 ---
 
-## Phase 4: Agent Integration — DEPENDS ON: Phase 2
+## CLI Interface
+
+### Setup
+
+```bash
+# Install CLI (Node 18+)
+cd cli && npm install -g .
+
+# Make wrapper executable
+chmod +x scripts/cli-wrapper.sh
+
+# Verify connectivity
+openbrain doctor --json
+```
+
+### Session initialization
+
+At the start of every session, agents should verify the CLI is available and healthy:
+
+```bash
+# Verify CLI is in PATH and services are reachable
+openbrain doctor --json
+# → { "passed": true, "checks": [...] }
+# → exit 0 if all green, exit 1 if any check failed
+```
+
+### Tool discovery
+
+Before invoking specific commands, agents can call the manifest to get machine-readable tool descriptions:
+
+```bash
+openbrain --manifest --json
+# → { "tools": [{ "name": "capture", "description": "...", "inputSchema": {...} }, ...] }
+```
+
+### Invocation
+
+Agents invoke `openbrain` as a subprocess. Always use `--json` flag. Parse stdout as JSON. Check exit codes.
+
+```bash
+# Basic pattern
+openbrain <command> --json [args]
+
+# Via wrapper (resolves PATH automatically)
+./scripts/cli-wrapper.sh <command> --json [args]
+```
+
+### Input escaping
+
+When passing user-supplied text, escape for the shell:
+
+```bash
+# Bash: use single quotes or escape inner quotes
+openbrain capture 'User'"'"'s thought with "quotes"' --json
+
+# PowerShell: escape inner quotes with backtick
+openbrain capture "User`'s thought with `"quotes`"" --json
+```
+
+### `--json` output schemas
+
+**`openbrain --manifest --json`**
+```json
+{ "tools": [{ "name": "capture", "description": "Store a thought with Ollama embedding", "inputSchema": { "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] } }, ...] }
+```
+
+**`openbrain capture "text" --json`**
+```json
+{ "id": "uuid", "content": "text", "created_at": "ISO8601", "embedded": true }
+```
+
+**`openbrain search "query" --json [--limit N] [--threshold X]`**
+```json
+{ "results": [{ "id": "uuid", "content": "text", "metadata": {}, "similarity": 0.82, "created_at": "ISO8601" }], "count": N }
+```
+
+**`openbrain list --json [--limit N]`**
+```json
+{ "thoughts": [{ "id": "uuid", "content": "text", "metadata": {}, "created_at": "ISO8601", "needs_embedding": false }], "count": N }
+```
+
+**`openbrain stats --json`**
+```json
+{ "total_thoughts": N, "pending_embeddings": N, "top_types": [{ "type": "observation", "count": 10 }], "top_topics": [...] }
+```
+
+**`openbrain --backfill --json`**
+```json
+{ "backfilled": 3, "remaining": 0 }
+```
+
+**`openbrain doctor --json`**
+```json
+{ "passed": true, "checks": [{ "name": "postgres", "passed": true, "message": "..." }] }
+```
+
+### Exit codes
+
+- `0` — success (including "no results found" for search)
+- `1` — failure (connection error, invalid input, service unavailable)
+
+### Embedding Failure / Staging
+
+If Ollama was unavailable at capture time, thoughts are stored with `needs_embedding = true`. Agents should call `openbrain --backfill --json` to process pending embeddings:
+
+```bash
+openbrain --backfill --json
+# → { "backfilled": N, "remaining": M }
+```
+
+The MCP server handles backfill automatically on every tool call. CLI agents must trigger it explicitly.
+
+### Source tracking
+
+When an agent captures via CLI, the `source` column defaults to `"local"`. To identify which agent captured a thought, agents can set the `source` field in metadata (future enhancement: `--source` flag).
+
+---
+
+## MCP Interface
+
+### Setup
+
+```bash
+# Make wrapper executable
+chmod +x scripts/mcp-wrapper.sh
+```
+
+In `~/.claude/mcp.json`:
+```json
+{
+  "mcpServers": {
+    "openbrain": {
+      "command": "/path/to/OBLocal/scripts/mcp-wrapper.sh"
+    }
+  }
+}
+```
+
+The wrapper uses `docker compose exec mcp` (service name, not container name) — works regardless of container naming.
+
+### Tools
+
+When connected via MCP, agents get 4 tools: `capture_thought`, `search_thoughts`, `list_thoughts`, `thought_stats`.
+
+### Backfill behavior
+
+The MCP server runs `backfillPendingEmbeddings()` opportunistically on **every** tool call, processing up to 50 pending embeddings before handling the actual request. No explicit backfill command needed.
+
+### Multiple agents sharing one brain
+
+All agents connect to the same Docker container via stdio wrapper. The `source` column in `thoughts` tracks which agent captured each entry.
+
+---
+
+## Architecture
+
+- **postgres** container: pgvector/pgvector:pg16 on port 5432
+- **mcp** container: Node.js MCP server, always-on, connects to Ollama at `host.docker.internal:11434`
+- **CLI** runs on host (not in Docker) — reads `~/.openbrain/config.json`
+- **MCP agents** spawn fresh Node.js process per invocation via `docker compose exec`
+
+## Config
+
+`~/.openbrain/config.json`:
+```json
+{
+  "database_url": "postgresql://postgres:openbrain@localhost:5432/openbrain",
+  "ollama_url": "http://localhost:11434",
+  "embedding_model": "nomic-embed-text",
+  "chat_model": "llama3.2-mini"
+}
+```
+
+## Ollama Models
+
+- `nomic-embed-text` — 1536-dim embedding vectors
+- `llama3.2-mini` — metadata extraction (JSON mode)
+
+Both must be pulled: `ollama pull nomic-embed-text && ollama pull llama3.2-mini`
+
+## Monorepo Structure
+
+```
+cli/          — openbrain CLI (Node 18+, host machine)
+server/       — MCP server (Node.js in Docker)
+schema/       — SQL migrations (run manually)
+setup/        — Setup scripts (run in sequence)
+scripts/
+  mcp-wrapper.sh   — MCP interface wrapper
+  cli-wrapper.sh   — CLI interface wrapper
+```
+
+## No Test Suite
+
+This repo has no automated tests. Setup is verified manually via `openbrain doctor` and `openbrain capture`.
+```
+
+---
+
+## Phase 4: MCP Interface (Alternative) — DEPENDS ON: Phase 2
+
+Phase 3 covers the CLI interface (primary). This phase covers the MCP interface (alternative) — the wrapper script that lets stdio-native agents connect.
+
+MCP interface details (setup, tools, multi-agent behavior) are documented in the `AGENTS.md` redesign in Phase 3.6. Only the wrapper implementation lives here.
 
 ### 4.1 `scripts/mcp-wrapper.sh`
 
@@ -395,27 +791,6 @@ docker compose exec -i mcp node /app/index.js
 ```
 
 This wrapper pipes stdin/stdout from the Docker container to the calling agent. Claude Code, Cursor, and other stdio-based agents use this to communicate with the containerized MCP server.
-
-### 4.2 Claude Code integration
-
-In `~/.claude/mcp.json`:
-```json
-{
-  "mcpServers": {
-    "openbrain": {
-      "command": "/path/to/local-version/scripts/mcp-wrapper.sh"
-    }
-  }
-}
-```
-
-### 4.3 Cursor / VS Code Copilot / Windsurf
-
-Same wrapper script. These clients also support stdio MCP.
-
-### 4.4 Multiple agents sharing one brain
-
-All agents connect to the same Docker container via stdio wrapper. The `source` column in `thoughts` tracks which agent captured each entry.
 
 ---
 
@@ -428,7 +803,7 @@ All agents connect to the same Docker container via stdio wrapper. The `source` 
 3. 02-run-migrations.sh            → user-initiated schema migration (Supabase-style)
 4. 03-setup-ollama.sh              → install Ollama + pull models
 5. 04-setup-cli.sh                → npm install -g the CLI (if not installed in step 1)
-6. 05-connect-agents.sh           → agent integration guide
+6. 05-connect-agents.sh           → both interfaces guide (CLI + MCP)
 ```
 
 **Design: `openbrain init` runs before Docker, writes config with defaults.**
@@ -508,7 +883,7 @@ openbrain init  # creates ~/.openbrain/config.json (skipped if already exists)
 
 ### 5.5 `setup/05-connect-agents.sh`
 
-Prints platform-specific instructions for Claude Code, Cursor, etc.
+Prints platform-specific instructions for both interfaces — CLI (subprocess) and MCP (stdio). Covers setup for Claude Code, Cursor, Windsurf, and any agent that invokes `openbrain` as a subprocess.
 
 ---
 
@@ -560,17 +935,17 @@ Each step has `✅ **Done when:**` checkpoints and numbered commands.
 
 ## Phase Dependency Matrix
 
-**Hard dependency chain:** Phase 1 → Phase 2/3/4/5 (sequential)
-**Independent phases:** Phase 6 (README) — can be written at any time
+**Hard dependency chain:** Phase 1 → Phase 2/3/5 (sequential)
+**Independent phases:** Phase 4 (MCP interface), Phase 6 (README) — can be written at any time
 
 ```
 Phase 1 (Docker + DB)         ← blocks all other phases
     ↓
 Phase 2 (MCP server)          ← needs Phase 1
-Phase 3 (CLI)                  ← needs Phase 1
+Phase 3 (CLI + CLI interface)   ← needs Phase 1
 Phase 5 (Setup scripts)        ← needs Phase 1
     ↓
-Phase 4 (Agent integration)   ← needs Phase 2 (mcp-wrapper.sh)
+Phase 4 (MCP interface)         ← needs Phase 2 (mcp-wrapper.sh) — the alternative interface
 
 Phase 6 (README)              ← INDEPENDENT — can start immediately
 ```
@@ -580,10 +955,11 @@ Phase 6 (README)              ← INDEPENDENT — can start immediately
 | Agent | Can work on | Dependency |
 |---|---|---|
 | Agent A | Phase 2 (MCP server) | Only Phase 1 |
-| Agent B | Phase 3 (CLI) | Only Phase 1 |
-| Agent C | Phase 6 (README) | **Nothing** |
+| Agent B | Phase 3 (CLI + CLI interface for agents) | Only Phase 1 |
+| Agent C | Phase 4 (MCP interface — alternative) | Only Phase 2 |
+| Agent D | Phase 6 (README) | **Nothing** |
 
-Agent A and Agent B can work **simultaneously** after Phase 1 completes. Agent C can start immediately.
+Agents A, B, C can all work **simultaneously** after their respective dependencies are met. Agent D can start immediately.
 
 ---
 
@@ -592,8 +968,9 @@ Agent A and Agent B can work **simultaneously** after Phase 1 completes. Agent C
 ```
 Phase 1 → docker-compose.yml + Dockerfile.mcp + schema/*.sql (blocks everything)
 Phase 2 → server/index.js (MCP server, stdio)         ┐ independent
-Phase 3 → cli/src/index.js                             ┘ after Phase 1
-Phase 4 → scripts/mcp-wrapper.sh                        (after Phase 2)
+Phase 3 → cli/src/index.js + cli-wrapper.sh         ┤ after Phase 1
+         + AGENTS.md CLI interface section            │
+Phase 4 → scripts/mcp-wrapper.sh (MCP interface — alternative)  (after Phase 2)
 Phase 5 → setup/*.sh scripts                            (after Phase 1)
 Phase 6 → README.md                                    (independent, start now)
 ```
@@ -613,16 +990,25 @@ Phase 6 → README.md                                    (independent, start now
 - [ ] Ollama embedding call returns 1536-dim array
 - [ ] MCP tools respond via stdio
 
-### Phase 3 — CLI (independent of Phase 2)
+### Phase 3 — CLI + CLI Interface for Agents (independent of Phase 2)
 - [ ] `npm install -g` the CLI
 - [ ] `openbrain capture "test"` stores thought with Ollama embedding
 - [ ] `openbrain list` returns stored thoughts
 - [ ] `openbrain doctor` reports all green
+- [ ] `openbrain search "test" --json` returns valid JSON with `results` or empty array
+- [ ] `openbrain capture "test" --json` returns valid JSON with `id`, `content`, `embedded`
+- [ ] `scripts/cli-wrapper.sh` is executable (`chmod +x`)
+- [ ] `cli-wrapper.sh doctor --json` works from any working directory
+- [ ] Agent can spawn `openbrain` as subprocess, parse JSON, handle exit code 1 on failure
+- [ ] `openbrain --manifest --json` returns valid machine-readable tool manifest
+- [ ] `openbrain --backfill --json` processes pending embeddings and returns `{ "backfilled": N, "remaining": M }`
+- [ ] `openbrain search "nonexistent" --json` returns exit 0 with `results: []` (not an error)
 
-### Phase 4 — Agent Integration (must follow Phase 2)
+### Phase 4 — MCP Interface (alternative, must follow Phase 2)
 - [ ] Claude Code connects via `mcp-wrapper.sh`
 - [ ] Claude Code `search_thoughts` tool returns results
 - [ ] Multiple agents can connect simultaneously (share one brain)
+- [ ] MCP server backfills pending embeddings on every tool call (verify by checking `needs_embedding = false` on staged thoughts after any tool call)
 
 ### Phase 5 — Setup Scripts
 - [ ] Each `.sh` script runs without error in isolation

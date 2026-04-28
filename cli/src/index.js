@@ -52,53 +52,146 @@ async function checkOllamaModel(ollamaUrl, model) {
   }
 }
 
-function output(format, data) {
-  if (format === 'json') {
-    console.log(JSON.stringify(data, null, 2));
+async function extractMetadata(text, ollamaUrl, chatModel = 'llama3.2-mini') {
+  try {
+    const response = await fetch(`${ollamaUrl}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: chatModel,
+        stream: false,
+        format: 'json',
+        messages: [{
+          role: 'system',
+          content: `Extract metadata from the user's thought. Return JSON with:
+- "people": array of people mentioned (empty if none)
+- "action_items": array of implied to-dos (empty if none)
+- "dates_mentioned": array of dates YYYY-MM-DD (empty if none)
+- "topics": array of 1-3 short topic tags (always at least one)
+- "type": one of "observation", "task", "idea", "reference", "person_note"
+Only extract what's explicitly there.`
+        }, { role: 'user', content: text }]
+      })
+    });
+    if (!response.ok) throw new Error(`Metadata extraction failed: ${response.status}`);
+    const data = await response.json();
+    return JSON.parse(data.message.content);
+  } catch {
+    return { topics: ['uncategorized'], type: 'observation' };
+  }
+}
+
+function outputJson(data) {
+  console.log(JSON.stringify(data, null, 2));
+}
+
+function outputText(data) {
+  if (Array.isArray(data)) {
+    data.forEach(item => console.log(item));
+  } else if (typeof data === 'object') {
+    Object.entries(data).forEach(([key, value]) => {
+      console.log(`${key}: ${value}`);
+    });
   } else {
-    if (Array.isArray(data)) {
-      data.forEach(item => console.log(item));
-    } else if (typeof data === 'object') {
-      Object.entries(data).forEach(([key, value]) => {
-        console.log(`${key}: ${value}`);
-      });
-    } else {
-      console.log(data);
+    console.log(data);
+  }
+}
+
+async function backfill(opts) {
+  const config = loadConfig();
+  if (!config) {
+    if (opts.json) outputJson({ backfilled: 0, remaining: 0, error: 'Config not found' });
+    else console.error('Error: Config not found. Run openbrain init first.');
+    return 1;
+  }
+
+  try {
+    const pool = new Pool({ connectionString: config.database_url });
+    const pending = await pool.query(
+      'SELECT id, content FROM thoughts WHERE needs_embedding = true AND embedding IS NULL ORDER BY created_at ASC LIMIT 50'
+    );
+
+    let backfilled = 0;
+    for (const row of pending.rows) {
+      try {
+        const embedding = await getEmbedding(row.content, config.ollama_url, config.embedding_model);
+        await pool.query(
+          'UPDATE thoughts SET embedding = $1, needs_embedding = false WHERE id = $2',
+          [embedding, row.id]
+        );
+        backfilled++;
+      } catch {
+        // Leave needs_embedding = true, will retry next time
+      }
     }
+
+    const remaining = await pool.query('SELECT count(*) FROM thoughts WHERE needs_embedding = true AND embedding IS NULL');
+    await pool.end();
+
+    if (opts.json) {
+      outputJson({ backfilled, remaining: parseInt(remaining.rows[0].count) });
+    } else {
+      console.log(`Backfilled ${backfilled} embeddings. ${remaining.rows[0].count} remaining.`);
+    }
+    return 0;
+  } catch (err) {
+    if (opts.json) outputJson({ backfilled: 0, remaining: 0, error: err.message });
+    else console.error(`Backfill failed: ${err.message}`);
+    return 1;
   }
 }
 
 async function capture(text, opts) {
   const config = loadConfig();
   if (!config) {
-    console.error('Error: Config not found. Run openbrain init first.');
+    if (opts.json) outputJson({ error: 'Config not found. Run openbrain init first.' });
+    else console.error('Error: Config not found. Run openbrain init first.');
     return 1;
   }
 
   try {
     const pool = new Pool({ connectionString: config.database_url });
-    const embedding = await getEmbedding(text, config.ollama_url, config.embedding_model);
 
-    const result = await pool.query(
-      `INSERT INTO thoughts (content, embedding, metadata, content_fingerprint)
-       VALUES ($1, $2, '{}', encode(sha256(convert_to(lower(trim(regexp_replace($1, '\\s+', ' ', 'g'))), 'UTF8')), 'hex'))
-       ON CONFLICT (content_fingerprint) WHERE content_fingerprint IS NOT NULL DO UPDATE
-       SET updated_at = now()
-       RETURNING id, created_at`,
-      [text, embedding]
+    const metadata = await extractMetadata(text, config.ollama_url, config.chat_model);
+
+    const fingerprint = await pool.query(
+      `SELECT encode(sha256(convert_to(lower(trim(regexp_replace($1, '\\s+', ' ', 'g'))), 'UTF8')), 'hex') as fp`,
+      [text]
     );
+    const fp = fingerprint.rows[0].fp;
+
+    const upsert = await pool.query(
+      `INSERT INTO thoughts (content, content_fingerprint, metadata)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (content_fingerprint) WHERE content_fingerprint IS NOT NULL DO UPDATE
+       SET updated_at = now(),
+           metadata = thoughts.metadata || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
+       RETURNING id, created_at`,
+      [text, fp, JSON.stringify(metadata)]
+    );
+
+    const { id, created_at } = upsert.rows[0];
+
+    let embedded = false;
+    try {
+      const embedding = await getEmbedding(text, config.ollama_url, config.embedding_model);
+      await pool.query('UPDATE thoughts SET embedding = $1, needs_embedding = false WHERE id = $2', [embedding, id]);
+      embedded = true;
+    } catch {
+      await pool.query('UPDATE thoughts SET needs_embedding = true WHERE id = $1 AND embedding IS NULL', [id]);
+    }
 
     await pool.end();
 
-    const row = result.rows[0];
     if (opts.json) {
-      output('json', { id: row.id, content: text, created_at: row.created_at, embedded: true });
+      outputJson({ id, content: text, created_at, embedded });
     } else {
-      console.log(`Captured: "${text}" (${row.id})`);
+      console.log(`Captured: "${text}" (${id})`);
     }
     return 0;
   } catch (err) {
-    console.error(`Capture failed: ${err.message}`);
+    if (opts.json) outputJson({ error: err.message });
+    else console.error(`Capture failed: ${err.message}`);
     return 1;
   }
 }
@@ -106,7 +199,8 @@ async function capture(text, opts) {
 async function search(query, opts) {
   const config = loadConfig();
   if (!config) {
-    console.error('Error: Config not found. Run openbrain init first.');
+    if (opts.json) outputJson({ results: [], count: 0, error: 'Config not found' });
+    else console.error('Error: Config not found. Run openbrain init first.');
     return 1;
   }
 
@@ -129,7 +223,7 @@ async function search(query, opts) {
     await pool.end();
 
     if (opts.json) {
-      output('json', { results: result.rows, count: result.rows.length });
+      outputJson({ results: result.rows, count: result.rows.length });
     } else {
       if (result.rows.length === 0) {
         console.log(`No thoughts found matching "${query}".`);
@@ -141,7 +235,8 @@ async function search(query, opts) {
     }
     return 0;
   } catch (err) {
-    console.error(`Search failed: ${err.message}`);
+    if (opts.json) outputJson({ results: [], count: 0, error: err.message });
+    else console.error(`Search failed: ${err.message}`);
     return 1;
   }
 }
@@ -149,7 +244,8 @@ async function search(query, opts) {
 async function listThoughts(opts) {
   const config = loadConfig();
   if (!config) {
-    console.error('Error: Config not found. Run openbrain init first.');
+    if (opts.json) outputJson({ thoughts: [], count: 0, error: 'Config not found' });
+    else console.error('Error: Config not found. Run openbrain init first.');
     return 1;
   }
 
@@ -168,7 +264,7 @@ async function listThoughts(opts) {
     await pool.end();
 
     if (opts.json) {
-      output('json', { thoughts: result.rows, count: result.rows.length });
+      outputJson({ thoughts: result.rows, count: result.rows.length });
     } else {
       if (result.rows.length === 0) {
         console.log('No thoughts stored yet.');
@@ -181,7 +277,8 @@ async function listThoughts(opts) {
     }
     return 0;
   } catch (err) {
-    console.error(`List failed: ${err.message}`);
+    if (opts.json) outputJson({ thoughts: [], count: 0, error: err.message });
+    else console.error(`List failed: ${err.message}`);
     return 1;
   }
 }
@@ -189,7 +286,8 @@ async function listThoughts(opts) {
 async function stats(opts) {
   const config = loadConfig();
   if (!config) {
-    console.error('Error: Config not found. Run openbrain init first.');
+    if (opts.json) outputJson({ total_thoughts: 0, pending_embeddings: 0, top_types: [], top_topics: [], error: 'Config not found' });
+    else console.error('Error: Config not found. Run openbrain init first.');
     return 1;
   }
 
@@ -227,7 +325,7 @@ async function stats(opts) {
     };
 
     if (opts.json) {
-      output('json', statsData);
+      outputJson(statsData);
     } else {
       console.log(`Total thoughts: ${statsData.total_thoughts}`);
       console.log(`Pending embeddings: ${statsData.pending_embeddings}`);
@@ -242,7 +340,8 @@ async function stats(opts) {
     }
     return 0;
   } catch (err) {
-    console.error(`Stats failed: ${err.message}`);
+    if (opts.json) outputJson({ total_thoughts: 0, pending_embeddings: 0, top_types: [], top_topics: [], error: err.message });
+    else console.error(`Stats failed: ${err.message}`);
     return 1;
   }
 }
@@ -253,7 +352,7 @@ async function doctor(opts) {
   const config = loadConfig();
   if (!config) {
     if (opts.json) {
-      output('json', { passed: false, checks: [{ name: 'config_file', passed: false, message: 'Config file not found at ~/.openbrain/config.json' }] });
+      outputJson({ passed: false, checks: [{ name: 'config_file', passed: false, message: 'Config file not found at ~/.openbrain/config.json' }] });
     } else {
       console.log('FAIL: Config file not found at ~/.openbrain/config.json');
     }
@@ -269,38 +368,27 @@ async function doctor(opts) {
     checks.push({ name: 'postgres', passed: true, message: 'Postgres is reachable' });
   } catch (err) {
     checks.push({ name: 'postgres', passed: false, message: `Postgres connection failed: ${err.message}` });
-    if (opts.json) {
-      output('json', { passed: false, checks });
-    } else {
-      console.log(`FAIL: Postgres - ${err.message}`);
-    }
+    if (opts.json) outputJson({ passed: false, checks });
+    else console.log(`FAIL: Postgres - ${err.message}`);
     return 1;
   }
 
   try {
     const response = await fetch(`${config.ollama_url}/api/tags`);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     checks.push({ name: 'ollama', passed: true, message: 'Ollama is reachable' });
   } catch (err) {
     checks.push({ name: 'ollama', passed: false, message: `Ollama connection failed: ${err.message}` });
-    if (opts.json) {
-      output('json', { passed: false, checks });
-    } else {
-      console.log(`FAIL: Ollama - ${err.message}`);
-    }
+    if (opts.json) outputJson({ passed: false, checks });
+    else console.log(`FAIL: Ollama - ${err.message}`);
     return 1;
   }
 
   const embeddingModelAvailable = await checkOllamaModel(config.ollama_url, config.embedding_model);
   if (!embeddingModelAvailable) {
     checks.push({ name: 'embedding_model', passed: false, message: `Model ${config.embedding_model} not pulled. Run: ollama pull ${config.embedding_model}` });
-    if (opts.json) {
-      output('json', { passed: false, checks });
-    } else {
-      console.log(`FAIL: Embedding model ${config.embedding_model} not pulled. Run: ollama pull ${config.embedding_model}`);
-    }
+    if (opts.json) outputJson({ passed: false, checks });
+    else console.log(`FAIL: Embedding model ${config.embedding_model} not pulled. Run: ollama pull ${config.embedding_model}`);
     return 1;
   }
   checks.push({ name: 'embedding_model', passed: true, message: `${config.embedding_model} is available` });
@@ -308,20 +396,17 @@ async function doctor(opts) {
   const chatModelAvailable = await checkOllamaModel(config.ollama_url, config.chat_model);
   if (!chatModelAvailable) {
     checks.push({ name: 'chat_model', passed: false, message: `Model ${config.chat_model} not pulled. Run: ollama pull ${config.chat_model}` });
-    if (opts.json) {
-      output('json', { passed: false, checks });
-    } else {
-      console.log(`FAIL: Chat model ${config.chat_model} not pulled. Run: ollama pull ${config.chat_model}`);
-    }
+    if (opts.json) outputJson({ passed: false, checks });
+    else console.log(`FAIL: Chat model ${config.chat_model} not pulled. Run: ollama pull ${config.chat_model}`);
     return 1;
   }
   checks.push({ name: 'chat_model', passed: true, message: `${config.chat_model} is available` });
 
   if (opts.json) {
-    output('json', { passed: true, checks });
+    outputJson({ passed: true, checks });
   } else {
     console.log('All checks passed:');
-    checks.forEach(c => console.log(`  ✓ ${c.message}`));
+    checks.forEach(c => console.log(`  - ${c.name}: ${c.message}`));
   }
   return 0;
 }
@@ -341,14 +426,77 @@ async function init(opts) {
     chat_model: 'llama3.2-mini'
   };
 
-  console.log('Creating default config at ~/.openbrain/config.json');
-  console.log(`  database_url: ${defaultConfig.database_url}`);
-  console.log(`  ollama_url: ${defaultConfig.ollama_url}`);
-  console.log(`  embedding_model: ${defaultConfig.embedding_model}`);
-  console.log(`  chat_model: ${defaultConfig.chat_model}`);
+  if (opts.json) {
+    outputJson({ config: defaultConfig, path: configPath });
+  } else {
+    console.log('Creating default config at ~/.openbrain/config.json');
+    console.log(`  database_url: ${defaultConfig.database_url}`);
+    console.log(`  ollama_url: ${defaultConfig.ollama_url}`);
+    console.log(`  embedding_model: ${defaultConfig.embedding_model}`);
+    console.log(`  chat_model: ${defaultConfig.chat_model}`);
+  }
 
   saveConfig(defaultConfig);
-  console.log('Config created. Edit ~/.openbrain/config.json to customize.');
+  if (!opts.json) console.log('Config created. Edit ~/.openbrain/config.json to customize.');
+  return 0;
+}
+
+function manifest(opts) {
+  const tools = [
+    {
+      name: 'capture',
+      description: 'Store a thought with Ollama embedding',
+      inputSchema: {
+        type: 'object',
+        properties: { text: { type: 'string' } },
+        required: ['text']
+      }
+    },
+    {
+      name: 'search',
+      description: 'Search thoughts using vector similarity',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string' },
+          limit: { type: 'number', default: 10 },
+          threshold: { type: 'number', default: 0.7 }
+        },
+        required: ['query']
+      }
+    },
+    {
+      name: 'list',
+      description: 'List recent thoughts',
+      inputSchema: {
+        type: 'object',
+        properties: { limit: { type: 'number', default: 10 } }
+      }
+    },
+    {
+      name: 'stats',
+      description: 'Show brain overview',
+      inputSchema: { type: 'object', properties: {} }
+    },
+    {
+      name: 'doctor',
+      description: 'Check Postgres, Ollama, config connectivity',
+      inputSchema: { type: 'object', properties: {} }
+    },
+    {
+      name: 'backfill',
+      description: 'Process pending embeddings',
+      inputSchema: { type: 'object', properties: {} }
+    }
+  ];
+
+  if (opts.json) {
+    outputJson({ tools });
+  } else {
+    tools.forEach(t => {
+      console.log(`${t.name}: ${t.description}`);
+    });
+  }
   return 0;
 }
 
@@ -367,5 +515,15 @@ program.command('stats').description('Show brain overview').option('--json', 'Ou
 program.command('doctor').description('Check Postgres, Ollama, and config connectivity').option('--json', 'Output as JSON').action(doctor);
 
 program.command('init').description('Create ~/.openbrain/config.json').option('--force', 'Overwrite existing config').action(init);
+
+program.option('--manifest', 'Output machine-readable tool manifest').option('--backfill', 'Process pending embeddings').action(async (opts) => {
+  if (opts.manifest) {
+    await manifest(opts);
+  } else if (opts.backfill) {
+    await backfill(opts);
+  } else {
+    program.help();
+  }
+});
 
 program.parse();
