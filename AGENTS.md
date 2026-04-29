@@ -1,6 +1,6 @@
 # Open Brain — Local AI Memory
 
-Local-first AI memory: PostgreSQL + pgvector in Docker. Two interfaces — **CLI** (primary) and **MCP server** (alternative). Same 4 capabilities on both.
+Local-first AI memory: PostgreSQL + pgvector in Docker. Two interfaces — **CLI** (primary) and **MCP server** (alternative). Same 5 capabilities on both.
 
 ## Capabilities
 
@@ -10,6 +10,7 @@ Local-first AI memory: PostgreSQL + pgvector in Docker. Two interfaces — **CLI
 | `openbrain search "..."` | `search_thoughts` | Semantic search |
 | `openbrain list --limit 10` | `list_thoughts` | Recent thoughts |
 | `openbrain stats` | `thought_stats` | Brain overview |
+| `openbrain --backfill` | `backfill_thoughts` | Process pending embeddings |
 
 ## CLI Setup
 
@@ -57,6 +58,7 @@ openbrain search "user theme preferences" --json --limit 3
 | Task assigned | Store it | `openbrain capture "Need to: ..."` |
 | User said X | Store it | `openbrain capture "User said: ..."` |
 | Starting new work | Find context | `openbrain search "keywords"` |
+| Ollama was down at capture | Backfill pending | `openbrain --backfill --json` |
 
 Brain persists automatically. No action needed at end of session.
 
@@ -69,22 +71,37 @@ openbrain <command> --json [args]      # direct
 
 **Exit codes:** `0` = success (including empty search results), `1` = failure.
 
-**If Ollama was down at capture:** call `openbrain --backfill --json` to process pending embeddings.
-
 ## CLI Output Schemas
 
+All CLI commands return JSON with a `success` field. Errors use `{success: false, error: "...", code: "..."}`.
+
 ```json
-// capture
-{ "id": "uuid", "content": "text", "created_at": "ISO8601", "embedded": true, "metadata": { "type": "observation", "topics": ["general"], "people": [], "action_items": [], "dates_mentioned": [] } }
+// capture success
+{ "success": true, "id": "uuid", "content": "text", "created_at": "ISO8601", "embedded": true, "metadata": {...} }
 
-// search
-{ "results": [{ "id": "uuid", "content": "text", "metadata": {...}, "similarity": 0.82, "created_at": "..." }], "count": N }
+// capture error
+{ "success": false, "error": "error message", "code": "CAPTURE_FAILED" }
 
-// list
-{ "thoughts": [{ "id": "uuid", "content": "text", "metadata": {...}, "created_at": "...", "needs_embedding": false }], "count": N }
+// search success
+{ "success": true, "results": [{ "id": "uuid", "content": "text", "metadata": {...}, "similarity": 0.82, "created_at": "..." }], "count": N }
 
-// stats
-{ "total_thoughts": N, "pending_embeddings": N, "top_types": [...], "top_topics": [...] }
+// search error
+{ "success": false, "error": "...", "code": "SEARCH_FAILED" }
+
+// list success
+{ "success": true, "thoughts": [{ "id": "uuid", "content": "text", "metadata": {...}, "created_at": "...", "needs_embedding": false }], "count": N }
+
+// list error
+{ "success": false, "error": "...", "code": "LIST_FAILED" }
+
+// stats success
+{ "success": true, "total_thoughts": N, "pending_embeddings": N, "top_types": [...], "top_topics": [...] }
+
+// backfill success
+{ "success": true, "backfilled": N, "remaining": N }
+
+// backfill error
+{ "success": false, "error": "...", "code": "BACKFILL_FAILED" }
 ```
 
 ## MCP Interface
@@ -104,7 +121,11 @@ In `~/.claude/mcp.json`:
 }
 ```
 
-4 tools: `capture_thought`, `search_thoughts`, `list_thoughts`, `thought_stats`. MCP auto-backfills on every call.
+5 tools: `capture_thought`, `search_thoughts`, `list_thoughts`, `thought_stats`, `backfill_thoughts`.
+
+**Backfill behavior:** Runs on `capture_thought` only. Use `backfill_thoughts` for explicit catch-up.
+
+**Error format:** All MCP error responses are JSON-stringified `{success: false, error: "...", code: "..."}` inside the text content field.
 
 ## Config
 
