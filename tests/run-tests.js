@@ -138,7 +138,7 @@ async function phase5Deduplication() {
 }
 
 async function phase6Backfill() {
-  const r1 = await exec(CLI, ['--backfill', '--json']);
+  const r1 = await exec(CLI, ['backfill', '--json']);
   log(r1.stdout);
   const j1 = parseJson(r1.stdout);
   assert(typeof j1.backfilled === 'number', 'should have backfilled count');

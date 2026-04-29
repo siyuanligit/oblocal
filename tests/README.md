@@ -20,11 +20,11 @@ npm test
 | Phase | Test | Description |
 |-------|------|-------------|
 | 1 | Infrastructure | `openbrain doctor --json` |
-| 2 | Tool Discovery | `--manifest --json`, `init` |
+| 2 | Tool Discovery | `--help`, `init` |
 | 3 | Capture & Embedding | Capture, list, stats |
 | 4 | Search | Vector similarity search |
 | 5 | De-duplication | Same content returns same ID |
-| 6 | Backfill | `--backfill --json` |
+| 6 | Backfill | `openbrain backfill --json` |
 | 10 | Edge Cases | Empty search, limit, long content |
 
 ## MCP Tests
