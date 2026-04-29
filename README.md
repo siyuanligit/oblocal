@@ -6,14 +6,23 @@ Zero cloud services. Your own PostgreSQL + pgvector database running in Docker o
 
 ---
 
+## Two Modes
+
+| Mode | What runs | Who uses it |
+| ---- | --------- | ----------- |
+| **CLI-only** | Postgres + CLI | Humans in terminal, scripts |
+| **Full** | Postgres + CLI + MCP server | Agents that prefer stdio transport |
+
+CLI is primary. MCP is optional — skip it if your agent can invoke CLI as a subprocess.
+
+---
+
 ![Step 1](https://img.shields.io/badge/Step_1-Install_Docker-1E88E5?style=for-the-badge)
 ![Step 2](https://img.shields.io/badge/Step_2-Start_Containers-43A047?style=for-the-badge)
 ![Step 3](https://img.shields.io/badge/Step_3-Run_Migrations-8E24AA?style=for-the-badge)
 ![Step 4](https://img.shields.io/badge/Step_4-Setup_Ollama-FB8C00?style=for-the-badge)
 ![Step 5](https://img.shields.io/badge/Step_5-Install_CLI-00897B?style=for-the-badge)
 ![Step 6](https://img.shields.io/badge/Step_6-Verify_Setup-5C6BC0?style=for-the-badge)
-![Step 7](https://img.shields.io/badge/Step_7-Connect_Agents-D555555?style=for-the-badge)
-![Step 8](https://img.shields.io/badge/Step_8-Use_It-8E24AA?style=for-the-badge)
 
 ---
 
@@ -45,9 +54,16 @@ docker info
 
 ![Step 2](https://img.shields.io/badge/Step_2-Start_Containers-43A047?style=for-the-badge)
 
-The `docker-compose.yml` starts two services: **postgres** (your database) and **mcp** (the MCP server, always-on).
+The `docker-compose.yml` starts **postgres** (your database). Optionally starts **mcp** (MCP server — skip if CLI-only).
 
-From the `local-version/` folder:
+**CLI-only (recommended for most users):**
+
+```bash
+docker compose up -d postgres
+docker compose ps
+```
+
+**Full mode (for MCP-capable agents):**
 
 ```bash
 docker compose up -d postgres
@@ -55,7 +71,7 @@ docker compose up -d mcp
 docker compose ps
 ```
 
-✅ **Done when:** Both containers show as `healthy` or `running` in `docker compose ps`.
+✅ **Done when:** Postgres container shows as `healthy` or `running` in `docker compose ps`.
 
 ---
 
@@ -183,7 +199,9 @@ openbrain list --limit 5
 
 ---
 
-![Step 7](https://img.shields.io/badge/Step_7-Connect_Agents-D555555?style=for-the-badge)
+## Optional: MCP for agents that prefer stdio transport
+
+If your agent doesn't support CLI subprocess, use MCP instead.
 
 The MCP server runs in Docker and communicates via stdio. The wrapper script pipes stdin/stdout between the container and your coding agent.
 
@@ -220,7 +238,7 @@ chmod +x scripts/mcp-wrapper.sh
 
 ---
 
-![Step 8](https://img.shields.io/badge/Step_8-Use_It-8E24AA?style=for-the-badge)
+### Use It
 
 Ask your AI naturally. It picks the right tool automatically:
 

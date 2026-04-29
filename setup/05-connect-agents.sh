@@ -1,8 +1,12 @@
 #!/bin/bash
-# Open Brain — Agent Integration Guide
-# Copy mcp-wrapper.sh and configure your agent's MCP settings
+# Open Brain — MCP Agent Integration (optional)
+# Only needed if your agent prefers MCP stdio transport over CLI subprocess.
+# CLI is always available — this step is entirely optional.
 
-echo "=== Open Brain — Agent Integration ==="
+echo "=== Open Brain — MCP Agent Integration (Optional) ==="
+echo ""
+echo "NOTE: This step is optional. CLI is primary — run openbrain --help to start."
+echo "Only use this if your agent requires MCP stdio transport."
 echo ""
 echo "STEP 1: Copy the MCP wrapper script"
 echo "  cp local-version/scripts/mcp-wrapper.sh ~/.openbrain/mcp-wrapper.sh"
