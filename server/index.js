@@ -144,9 +144,13 @@ server.tool(
   "Get aggregate statistics about thoughts",
   {},
   async () => {
-    const total = await pgPool.query('SELECT count(*) FROM thoughts');
-    const withEmbeddings = await pgPool.query('SELECT count(*) FROM thoughts WHERE embedding IS NOT NULL');
-    const pending = await pgPool.query('SELECT count(*) FROM thoughts WHERE needs_embedding = true');
+    const statsResult = await pgPool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE true) as total,
+        COUNT(*) FILTER (WHERE needs_embedding = true AND embedding IS NULL) as pending,
+        COUNT(*) FILTER (WHERE embedding IS NOT NULL) as with_embeddings
+      FROM thoughts
+    `);
 
     const topTypes = await pgPool.query(`
       SELECT metadata->>'type' as type, count(*) as count
@@ -174,9 +178,9 @@ server.tool(
     `);
 
     let response = "Thought Statistics\n==================\n";
-    response += `Total thoughts: ${total.rows[0].count}\n`;
-    response += `With embeddings: ${withEmbeddings.rows[0].count}\n`;
-    response += `Pending embedding: ${pending.rows[0].count}\n\n`;
+    response += `Total thoughts: ${statsResult.rows[0].total}\n`;
+    response += `With embeddings: ${statsResult.rows[0].with_embeddings}\n`;
+    response += `Pending embedding: ${statsResult.rows[0].pending}\n\n`;
 
     response += "Top Types:\n";
     for (const row of topTypes.rows) {

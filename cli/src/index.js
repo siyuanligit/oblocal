@@ -5,7 +5,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
-import { MAX_CONTENT_LENGTH, FALLBACK_METADATA } from '../lib/constants.js';
+import { MAX_CONTENT_LENGTH } from '../lib/constants.js';
 import { getEmbedding, extractMetadata, backfillPendingEmbeddings } from '../lib/ollama.js';
 
 const { Pool } = pg;
@@ -403,65 +403,6 @@ async function init(opts) {
   return 0;
 }
 
-function manifest(opts) {
-  const tools = [
-    {
-      name: 'capture',
-      description: 'Store a thought with Ollama embedding',
-      inputSchema: {
-        type: 'object',
-        properties: { text: { type: 'string' } },
-        required: ['text']
-      }
-    },
-    {
-      name: 'search',
-      description: 'Search thoughts using vector similarity',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          query: { type: 'string' },
-          limit: { type: 'number', default: 10 },
-          threshold: { type: 'number', default: 0.7 }
-        },
-        required: ['query']
-      }
-    },
-    {
-      name: 'list',
-      description: 'List recent thoughts',
-      inputSchema: {
-        type: 'object',
-        properties: { limit: { type: 'number', default: 10 } }
-      }
-    },
-    {
-      name: 'stats',
-      description: 'Show brain overview',
-      inputSchema: { type: 'object', properties: {} }
-    },
-    {
-      name: 'doctor',
-      description: 'Check Postgres, Ollama, config connectivity',
-      inputSchema: { type: 'object', properties: {} }
-    },
-    {
-      name: 'backfill',
-      description: 'Process pending embeddings',
-      inputSchema: { type: 'object', properties: {} }
-    }
-  ];
-
-  if (opts.json) {
-    outputJson({ success: true, tools });
-  } else {
-    tools.forEach(t => {
-      console.log(`${t.name}: ${t.description}`);
-    });
-  }
-  return 0;
-}
-
 const program = new Command();
 
 program.name('openbrain').description('Open Brain CLI - local AI memory').version('1.0.0');
@@ -478,14 +419,6 @@ program.command('doctor').description('Check Postgres, Ollama, and config connec
 
 program.command('init').description('Create ~/.openbrain/config.json').option('--force', 'Overwrite existing config').action(init);
 
-program.option('--manifest', 'Output machine-readable tool manifest').option('--backfill', 'Process pending embeddings').action(async (opts) => {
-  if (opts.manifest) {
-    await manifest(opts);
-  } else if (opts.backfill) {
-    await backfill(opts);
-  } else {
-    program.help();
-  }
-});
+program.command('backfill').description('Process pending embeddings').option('--json', 'Output as JSON').action(backfill);
 
 program.parse();

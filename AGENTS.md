@@ -10,7 +10,7 @@ Local-first AI memory: PostgreSQL + pgvector in Docker. Two interfaces — **CLI
 | `openbrain search "..."` | `search_thoughts` | Semantic search |
 | `openbrain list --limit 10` | `list_thoughts` | Recent thoughts |
 | `openbrain stats` | `thought_stats` | Brain overview |
-| `openbrain --backfill` | `backfill_thoughts` | Process pending embeddings |
+| `openbrain backfill` | `backfill_thoughts` | Process pending embeddings |
 
 ## CLI Setup
 
@@ -58,7 +58,7 @@ openbrain search "user theme preferences" --json --limit 3
 | Task assigned | Store it | `openbrain capture "Need to: ..."` |
 | User said X | Store it | `openbrain capture "User said: ..."` |
 | Starting new work | Find context | `openbrain search "keywords"` |
-| Ollama was down at capture | Backfill pending | `openbrain --backfill --json` |
+| Ollama was down at capture | Backfill pending | `openbrain backfill` |
 
 Brain persists automatically. No action needed at end of session.
 
