@@ -66,7 +66,7 @@ async function phase2ToolDiscovery() {
   assert(c1 === 0, 'manifest exited non-zero');
   assertJson(m1, 'manifest should be JSON');
   const manifest = parseJson(m1);
-  assert(manifest.tools && manifest.tools.length === 4, 'should have 4 tools');
+  assert(manifest.tools && manifest.tools.length === 6, 'should have 6 tools');
 
   const { code: c2, stdout: m2 } = await exec(CLI, ['init']);
   log(m2);

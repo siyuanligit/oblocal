@@ -5,9 +5,10 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
+import { MAX_CONTENT_LENGTH, FALLBACK_METADATA } from '../lib/constants.js';
+import { getEmbedding, extractMetadata, backfillPendingEmbeddings } from '../lib/ollama.js';
 
 const { Pool } = pg;
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const CONFIG_PATH = path.join(os.homedir(), '.openbrain', 'config.json');
 
@@ -28,19 +29,6 @@ function saveConfig(config) {
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
 }
 
-async function getEmbedding(text, ollamaUrl, model = 'nomic-embed-text') {
-  const response = await fetch(`${ollamaUrl}/api/embeddings`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, prompt: text })
-  });
-  if (!response.ok) {
-    throw new Error(`Ollama embedding failed: ${response.statusText}`);
-  }
-  const data = await response.json();
-  return data.embedding;
-}
-
 async function checkOllamaModel(ollamaUrl, model) {
   try {
     const response = await fetch(`${ollamaUrl}/api/tags`);
@@ -52,112 +40,36 @@ async function checkOllamaModel(ollamaUrl, model) {
   }
 }
 
-const VALID_TYPES = ['observation', 'task', 'idea', 'reference', 'person_note'];
-const MAX_TOPICS = 3;
-const FALLBACK_METADATA = { topics: ['uncategorized'], type: 'observation', people: [], action_items: [], dates_mentioned: [] };
-
-function safeExtractMetadata(raw) {
-  try {
-    const data = JSON.parse(raw);
-    if (!data || typeof data !== 'object') return FALLBACK_METADATA;
-    const topics = Array.isArray(data.topics) ? data.topics.slice(0, MAX_TOPICS) : [];
-    if (topics.length === 0) return FALLBACK_METADATA;
-    if (!topics.every(t => typeof t === 'string')) return FALLBACK_METADATA;
-    const type = typeof data.type === 'string' && VALID_TYPES.includes(data.type) ? data.type : FALLBACK_METADATA.type;
-    const people = Array.isArray(data.people) ? data.people.filter(p => typeof p === 'string') : [];
-    const action_items = Array.isArray(data.action_items) ? data.action_items.filter(a => typeof a === 'string') : [];
-    const dates_mentioned = Array.isArray(data.dates_mentioned) ? data.dates_mentioned.filter(d => typeof d === 'string') : [];
-    return { topics, type, people, action_items, dates_mentioned };
-  } catch {
-    return FALLBACK_METADATA;
-  }
-}
-
-async function extractMetadata(text, ollamaUrl, chatModel = 'llama3.2-mini') {
-  const safeText = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
-  try {
-    const response = await fetch(`${ollamaUrl}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: chatModel,
-        stream: false,
-        format: 'json',
-        messages: [{
-          role: 'system',
-          content: `Extract metadata from the user's thought. Return JSON with:
-- "people": array of people mentioned (empty if none)
-- "action_items": array of implied to-dos (empty if none)
-- "dates_mentioned": array of dates YYYY-MM-DD (empty if none)
-- "topics": array of 1-3 short topic tags (always at least one)
-- "type": one of "observation", "task", "idea", "reference", "person_note"
-Only extract what's explicitly there.`
-        }, { role: 'user', content: safeText }]
-      })
-    });
-    if (!response.ok) throw new Error(`Metadata extraction failed: ${response.status}`);
-    const data = await response.json();
-    return safeExtractMetadata(data.message?.content);
-  } catch {
-    return FALLBACK_METADATA;
-  }
+function errResponse(code, error) {
+  return { success: false, error, code };
 }
 
 function outputJson(data) {
   console.log(JSON.stringify(data, null, 2));
 }
 
-function outputText(data) {
-  if (Array.isArray(data)) {
-    data.forEach(item => console.log(item));
-  } else if (typeof data === 'object') {
-    Object.entries(data).forEach(([key, value]) => {
-      console.log(`${key}: ${value}`);
-    });
-  } else {
-    console.log(data);
-  }
-}
-
 async function backfill(opts) {
   const config = loadConfig();
   if (!config) {
-    if (opts.json) outputJson({ backfilled: 0, remaining: 0, error: 'Config not found' });
+    if (opts.json) outputJson(errResponse('CONFIG_NOT_FOUND', 'Config not found. Run openbrain init first.'));
     else console.error('Error: Config not found. Run openbrain init first.');
     return 1;
   }
 
   try {
     const pool = new Pool({ connectionString: config.database_url });
-    const pending = await pool.query(
-      'SELECT id, content FROM thoughts WHERE needs_embedding = true AND embedding IS NULL ORDER BY created_at ASC LIMIT 50'
-    );
-
-    let backfilled = 0;
-    for (const row of pending.rows) {
-      try {
-        const embedding = await getEmbedding(row.content, config.ollama_url, config.embedding_model);
-        await pool.query(
-          'UPDATE thoughts SET embedding = $1, needs_embedding = false WHERE id = $2',
-          [embedding, row.id]
-        );
-        backfilled++;
-      } catch (err) {
-        if (!opts.json) console.error(`  [backfill] Failed embedding for thought ${row.id}: ${err.message}`);
-      }
-    }
-
+    const backfilled = await backfillPendingEmbeddings(pool, config.ollama_url, config.embedding_model);
     const remaining = await pool.query('SELECT count(*) FROM thoughts WHERE needs_embedding = true AND embedding IS NULL');
     await pool.end();
 
     if (opts.json) {
-      outputJson({ backfilled, remaining: parseInt(remaining.rows[0].count) });
+      outputJson({ success: true, backfilled, remaining: parseInt(remaining.rows[0].count) });
     } else {
       console.log(`Backfilled ${backfilled} embeddings. ${remaining.rows[0].count} remaining.`);
     }
     return 0;
   } catch (err) {
-    if (opts.json) outputJson({ backfilled: 0, remaining: 0, error: err.message });
+    if (opts.json) outputJson(errResponse('BACKFILL_FAILED', err.message));
     else console.error(`Backfill failed: ${err.message}`);
     return 1;
   }
@@ -166,14 +78,13 @@ async function backfill(opts) {
 async function capture(text, opts) {
   const config = loadConfig();
   if (!config) {
-    if (opts.json) outputJson({ error: 'Config not found. Run openbrain init first.' });
+    if (opts.json) outputJson(errResponse('CONFIG_NOT_FOUND', 'Config not found. Run openbrain init first.'));
     else console.error('Error: Config not found. Run openbrain init first.');
     return 1;
   }
 
-  const MAX_CONTENT_LENGTH = 10000;
   if (text.length > MAX_CONTENT_LENGTH) {
-    if (opts.json) outputJson({ error: `Content exceeds maximum length of ${MAX_CONTENT_LENGTH} characters` });
+    if (opts.json) outputJson(errResponse('CONTENT_TOO_LONG', `Content exceeds maximum length of ${MAX_CONTENT_LENGTH} characters`));
     else console.error(`Error: Content exceeds maximum length of ${MAX_CONTENT_LENGTH} characters`);
     return 1;
   }
@@ -218,7 +129,7 @@ async function capture(text, opts) {
       await client.query('COMMIT');
 
       if (opts.json) {
-        outputJson({ id, content: text, created_at, embedded, metadata });
+        outputJson({ success: true, id, content: text, created_at, embedded, metadata });
       } else {
         console.log(`Captured: "${text}" (${id})`);
       }
@@ -230,7 +141,7 @@ async function capture(text, opts) {
       client.release();
     }
   } catch (err) {
-    if (opts.json) outputJson({ error: err.message });
+    if (opts.json) outputJson(errResponse('CAPTURE_FAILED', err.message));
     else console.error(`Capture failed: ${err.message}`);
     return 1;
   } finally {
@@ -241,7 +152,7 @@ async function capture(text, opts) {
 async function search(query, opts) {
   const config = loadConfig();
   if (!config) {
-    if (opts.json) outputJson({ results: [], count: 0, error: 'Config not found' });
+    if (opts.json) outputJson(errResponse('CONFIG_NOT_FOUND', 'Config not found. Run openbrain init first.'));
     else console.error('Error: Config not found. Run openbrain init first.');
     return 1;
   }
@@ -265,7 +176,7 @@ async function search(query, opts) {
     await pool.end();
 
     if (opts.json) {
-      outputJson({ results: result.rows, count: result.rows.length });
+      outputJson({ success: true, results: result.rows, count: result.rows.length });
     } else {
       if (result.rows.length === 0) {
         console.log(`No thoughts found matching "${query}".`);
@@ -277,7 +188,7 @@ async function search(query, opts) {
     }
     return 0;
   } catch (err) {
-    if (opts.json) outputJson({ results: [], count: 0, error: err.message });
+    if (opts.json) outputJson(errResponse('SEARCH_FAILED', err.message));
     else console.error(`Search failed: ${err.message}`);
     return 1;
   }
@@ -286,7 +197,7 @@ async function search(query, opts) {
 async function listThoughts(opts) {
   const config = loadConfig();
   if (!config) {
-    if (opts.json) outputJson({ thoughts: [], count: 0, error: 'Config not found' });
+    if (opts.json) outputJson(errResponse('CONFIG_NOT_FOUND', 'Config not found. Run openbrain init first.'));
     else console.error('Error: Config not found. Run openbrain init first.');
     return 1;
   }
@@ -306,7 +217,7 @@ async function listThoughts(opts) {
     await pool.end();
 
     if (opts.json) {
-      outputJson({ thoughts: result.rows, count: result.rows.length });
+      outputJson({ success: true, thoughts: result.rows, count: result.rows.length });
     } else {
       if (result.rows.length === 0) {
         console.log('No thoughts stored yet.');
@@ -319,7 +230,7 @@ async function listThoughts(opts) {
     }
     return 0;
   } catch (err) {
-    if (opts.json) outputJson({ thoughts: [], count: 0, error: err.message });
+    if (opts.json) outputJson(errResponse('LIST_FAILED', err.message));
     else console.error(`List failed: ${err.message}`);
     return 1;
   }
@@ -328,7 +239,7 @@ async function listThoughts(opts) {
 async function stats(opts) {
   const config = loadConfig();
   if (!config) {
-    if (opts.json) outputJson({ total_thoughts: 0, pending_embeddings: 0, top_types: [], top_topics: [], error: 'Config not found' });
+    if (opts.json) outputJson(errResponse('CONFIG_NOT_FOUND', 'Config not found. Run openbrain init first.'));
     else console.error('Error: Config not found. Run openbrain init first.');
     return 1;
   }
@@ -336,8 +247,13 @@ async function stats(opts) {
   try {
     const pool = new Pool({ connectionString: config.database_url });
 
-    const totalResult = await pool.query('SELECT COUNT(*) as total FROM thoughts');
-    const pendingResult = await pool.query('SELECT COUNT(*) as pending FROM thoughts WHERE needs_embedding = true AND embedding IS NULL');
+    const statsResult = await pool.query(`
+      SELECT
+        COUNT(*) FILTER (WHERE true) as total,
+        COUNT(*) FILTER (WHERE needs_embedding = true AND embedding IS NULL) as pending,
+        COUNT(*) FILTER (WHERE embedding IS NOT NULL) as with_embeddings
+      FROM thoughts
+    `);
 
     const typeResult = await pool.query(
       `SELECT metadata->>'type' as type, COUNT(*) as count
@@ -360,8 +276,9 @@ async function stats(opts) {
     await pool.end();
 
     const statsData = {
-      total_thoughts: parseInt(totalResult.rows[0].total),
-      pending_embeddings: parseInt(pendingResult.rows[0].pending),
+      success: true,
+      total_thoughts: parseInt(statsResult.rows[0].total),
+      pending_embeddings: parseInt(statsResult.rows[0].pending),
       top_types: typeResult.rows,
       top_topics: topicResult.rows
     };
@@ -382,7 +299,7 @@ async function stats(opts) {
     }
     return 0;
   } catch (err) {
-    if (opts.json) outputJson({ total_thoughts: 0, pending_embeddings: 0, top_types: [], top_topics: [], error: err.message });
+    if (opts.json) outputJson(errResponse('STATS_FAILED', err.message));
     else console.error(`Stats failed: ${err.message}`);
     return 1;
   }
@@ -394,7 +311,7 @@ async function doctor(opts) {
   const config = loadConfig();
   if (!config) {
     if (opts.json) {
-      outputJson({ passed: false, checks: [{ name: 'config_file', passed: false, message: 'Config file not found at ~/.openbrain/config.json' }] });
+      outputJson({ success: false, passed: false, checks: [{ name: 'config_file', passed: false, message: 'Config file not found at ~/.openbrain/config.json' }] });
     } else {
       console.log('FAIL: Config file not found at ~/.openbrain/config.json');
     }
@@ -404,13 +321,15 @@ async function doctor(opts) {
   checks.push({ name: 'config_file', passed: true, message: 'Config file exists and is valid JSON' });
 
   try {
-    const pool = new Pool({ connectionString: config.database_url });
-    await pool.query('SELECT 1');
-    await pool.end();
+    const testPool = new Pool({ connectionString: config.database_url });
+    const testClient = await testPool.connect();
+    await testClient.query('SELECT 1');
+    testClient.release();
+    await testPool.end();
     checks.push({ name: 'postgres', passed: true, message: 'Postgres is reachable' });
   } catch (err) {
     checks.push({ name: 'postgres', passed: false, message: `Postgres connection failed: ${err.message}` });
-    if (opts.json) outputJson({ passed: false, checks });
+    if (opts.json) outputJson({ success: false, passed: false, checks });
     else console.log(`FAIL: Postgres - ${err.message}`);
     return 1;
   }
@@ -421,7 +340,7 @@ async function doctor(opts) {
     checks.push({ name: 'ollama', passed: true, message: 'Ollama is reachable' });
   } catch (err) {
     checks.push({ name: 'ollama', passed: false, message: `Ollama connection failed: ${err.message}` });
-    if (opts.json) outputJson({ passed: false, checks });
+    if (opts.json) outputJson({ success: false, passed: false, checks });
     else console.log(`FAIL: Ollama - ${err.message}`);
     return 1;
   }
@@ -429,7 +348,7 @@ async function doctor(opts) {
   const embeddingModelAvailable = await checkOllamaModel(config.ollama_url, config.embedding_model);
   if (!embeddingModelAvailable) {
     checks.push({ name: 'embedding_model', passed: false, message: `Model ${config.embedding_model} not pulled. Run: ollama pull ${config.embedding_model}` });
-    if (opts.json) outputJson({ passed: false, checks });
+    if (opts.json) outputJson({ success: false, passed: false, checks });
     else console.log(`FAIL: Embedding model ${config.embedding_model} not pulled. Run: ollama pull ${config.embedding_model}`);
     return 1;
   }
@@ -438,14 +357,14 @@ async function doctor(opts) {
   const chatModelAvailable = await checkOllamaModel(config.ollama_url, config.chat_model);
   if (!chatModelAvailable) {
     checks.push({ name: 'chat_model', passed: false, message: `Model ${config.chat_model} not pulled. Run: ollama pull ${config.chat_model}` });
-    if (opts.json) outputJson({ passed: false, checks });
+    if (opts.json) outputJson({ success: false, passed: false, checks });
     else console.log(`FAIL: Chat model ${config.chat_model} not pulled. Run: ollama pull ${config.chat_model}`);
     return 1;
   }
   checks.push({ name: 'chat_model', passed: true, message: `${config.chat_model} is available` });
 
   if (opts.json) {
-    outputJson({ passed: true, checks });
+    outputJson({ success: true, passed: true, checks });
   } else {
     console.log('All checks passed:');
     checks.forEach(c => console.log(`  - ${c.name}: ${c.message}`));
@@ -469,14 +388,14 @@ async function init(opts) {
   };
 
   if (opts.json) {
-    outputJson({ config: defaultConfig, path: configPath });
+    outputJson({ success: true, config: defaultConfig, path: configPath });
   } else {
     console.log('Creating default config at ~/.openbrain/config.json');
     console.log(`  database_url: ${defaultConfig.database_url}`);
     console.log(`  ollama_url: ${defaultConfig.ollama_url}`);
     console.log(`  embedding_model: ${defaultConfig.embedding_model}`);
     console.log(`  chat_model: ${defaultConfig.chat_model}`);
-    console.log('\n  \u26a0\ufe0f  WARNING: Using default credentials. Change \'openbrain\' password for production use.');
+    console.log('\n  ⚠️  WARNING: Using default credentials. Change \'openbrain\' password for production use.');
   }
 
   saveConfig(defaultConfig);
@@ -534,7 +453,7 @@ function manifest(opts) {
   ];
 
   if (opts.json) {
-    outputJson({ tools });
+    outputJson({ success: true, tools });
   } else {
     tools.forEach(t => {
       console.log(`${t.name}: ${t.description}`);
