@@ -52,6 +52,27 @@ async function checkOllamaModel(ollamaUrl, model) {
   }
 }
 
+const VALID_TYPES = ['observation', 'task', 'idea', 'reference', 'person_note'];
+const MAX_TOPICS = 3;
+const FALLBACK_METADATA = { topics: ['uncategorized'], type: 'observation', people: [], action_items: [], dates_mentioned: [] };
+
+function safeExtractMetadata(raw) {
+  try {
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== 'object') return FALLBACK_METADATA;
+    const topics = Array.isArray(data.topics) ? data.topics.slice(0, MAX_TOPICS) : [];
+    if (topics.length === 0) return FALLBACK_METADATA;
+    if (!topics.every(t => typeof t === 'string')) return FALLBACK_METADATA;
+    const type = typeof data.type === 'string' && VALID_TYPES.includes(data.type) ? data.type : FALLBACK_METADATA.type;
+    const people = Array.isArray(data.people) ? data.people.filter(p => typeof p === 'string') : [];
+    const action_items = Array.isArray(data.action_items) ? data.action_items.filter(a => typeof a === 'string') : [];
+    const dates_mentioned = Array.isArray(data.dates_mentioned) ? data.dates_mentioned.filter(d => typeof d === 'string') : [];
+    return { topics, type, people, action_items, dates_mentioned };
+  } catch {
+    return FALLBACK_METADATA;
+  }
+}
+
 async function extractMetadata(text, ollamaUrl, chatModel = 'llama3.2-mini') {
   const safeText = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
   try {
@@ -76,13 +97,9 @@ Only extract what's explicitly there.`
     });
     if (!response.ok) throw new Error(`Metadata extraction failed: ${response.status}`);
     const data = await response.json();
-    try {
-      return JSON.parse(data.message.content);
-    } catch {
-      return { topics: ['uncategorized'], type: 'observation' };
-    }
+    return safeExtractMetadata(data.message?.content);
   } catch {
-    return { topics: ['uncategorized'], type: 'observation' };
+    return FALLBACK_METADATA;
   }
 }
 
@@ -201,7 +218,7 @@ async function capture(text, opts) {
       await client.query('COMMIT');
 
       if (opts.json) {
-        outputJson({ id, content: text, created_at, embedded });
+        outputJson({ id, content: text, created_at, embedded, metadata });
       } else {
         console.log(`Captured: "${text}" (${id})`);
       }

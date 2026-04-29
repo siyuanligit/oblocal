@@ -22,15 +22,42 @@ try {
 
 const pgPool = new Pool({ connectionString: config.database_url });
 
-async function getEmbedding(text, ollamaUrl) {
+async function getEmbedding(text, ollamaUrl, model = 'nomic-embed-text') {
   const response = await fetch(`${ollamaUrl}/api/embeddings`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "nomic-embed-text", prompt: text })
+    body: JSON.stringify({ model, prompt: text })
   });
   if (!response.ok) throw new Error(`Embedding failed: ${response.status}`);
   const data = await response.json();
   return data.embedding;
+}
+
+const VALID_TYPES = ['observation', 'task', 'idea', 'reference', 'person_note'];
+const MAX_TOPICS = 3;
+const FALLBACK_METADATA = { topics: ['uncategorized'], type: 'observation', people: [], action_items: [], dates_mentioned: [] };
+
+function safeExtractMetadata(raw) {
+  try {
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== 'object') return FALLBACK_METADATA;
+
+    const topics = Array.isArray(data.topics) ? data.topics.slice(0, MAX_TOPICS) : [];
+    if (topics.length === 0) return FALLBACK_METADATA;
+    if (!topics.every(t => typeof t === 'string')) return FALLBACK_METADATA;
+
+    const type = typeof data.type === 'string' && VALID_TYPES.includes(data.type)
+      ? data.type
+      : FALLBACK_METADATA.type;
+
+    const people = Array.isArray(data.people) ? data.people.filter(p => typeof p === 'string') : [];
+    const action_items = Array.isArray(data.action_items) ? data.action_items.filter(a => typeof a === 'string') : [];
+    const dates_mentioned = Array.isArray(data.dates_mentioned) ? data.dates_mentioned.filter(d => typeof d === 'string') : [];
+
+    return { topics, type, people, action_items, dates_mentioned };
+  } catch {
+    return FALLBACK_METADATA;
+  }
 }
 
 async function extractMetadata(text, ollamaUrl, chatModel) {
@@ -57,13 +84,9 @@ Only extract what's explicitly there.`
     });
     if (!response.ok) throw new Error(`Metadata extraction failed: ${response.status}`);
     const data = await response.json();
-    try {
-      return JSON.parse(data.message.content);
-    } catch {
-      return { topics: ["uncategorized"], type: "observation" };
-    }
+    return safeExtractMetadata(data.message?.content);
   } catch {
-    return { topics: ["uncategorized"], type: "observation" };
+    return FALLBACK_METADATA;
   }
 }
 
@@ -73,7 +96,7 @@ async function backfillPendingEmbeddings(pgPool, ollamaUrl) {
   );
   for (const row of result.rows) {
     try {
-      const embedding = await getEmbedding(row.content, ollamaUrl);
+      const embedding = await getEmbedding(row.content, ollamaUrl, config.embedding_model);
       await pgPool.query(
         'UPDATE thoughts SET embedding = $1, needs_embedding = false WHERE id = $2',
         [embedding, row.id]
@@ -103,7 +126,7 @@ server.tool(
 
     let embedding;
     try {
-      embedding = await getEmbedding(query, config.ollama_url);
+      embedding = await getEmbedding(query, config.ollama_url, config.embedding_model);
     } catch {
       return { content: [{ type: "text", text: "Ollama unavailable — cannot generate query embedding." }] };
     }
@@ -157,7 +180,9 @@ server.tool(
     let paramIdx = 1;
 
     if (days) {
-      query += ` AND created_at >= now() - interval '${days} days'`;
+      query += ` AND created_at >= now() - make_interval(days => $${paramIdx})`;
+      params.push(parseInt(days));
+      paramIdx++;
     }
     if (type) {
       query += ` AND metadata->>'type' = $${paramIdx}`;
@@ -258,6 +283,8 @@ server.tool(
   }
 );
 
+const MAX_CONTENT_LENGTH = 10000;
+
 server.tool(
   "capture_thought",
   "Capture a new thought with automatic embedding and metadata extraction",
@@ -265,40 +292,57 @@ server.tool(
     content: { type: "string", description: "The thought content to capture" }
   },
   async ({ content }) => {
+    if (content.length > MAX_CONTENT_LENGTH) {
+      return { content: [{ type: "text", text: `Content exceeds maximum length of ${MAX_CONTENT_LENGTH} characters` }] };
+    }
+
     const metadata = await extractMetadata(content, config.ollama_url, config.chat_model);
 
-    let upsertResult;
+    const client = await pgPool.connect();
     try {
-      upsertResult = await pgPool.query(
-        `SELECT * FROM upsert_thought($1::text, $2::jsonb)`,
-        [content, JSON.stringify(metadata)]
-      );
+      await client.query('BEGIN');
+
+      let upsertResult;
+      try {
+        upsertResult = await client.query(
+          `SELECT * FROM upsert_thought($1::text, $2::jsonb)`,
+          [content, JSON.stringify(metadata)]
+        );
+      } catch (err) {
+        await client.query('ROLLBACK');
+        return { content: [{ type: "text", text: `Failed to capture thought: ${err.message}` }] };
+      }
+
+      const { id } = upsertResult.rows[0];
+
+      let embeddingSuccess = false;
+      try {
+        const embedding = await getEmbedding(content, config.ollama_url, config.embedding_model);
+        await client.query(
+          'UPDATE thoughts SET embedding = $1, needs_embedding = false WHERE id = $2',
+          [embedding, id]
+        );
+        embeddingSuccess = true;
+      } catch (err) {
+        await client.query(
+          'UPDATE thoughts SET needs_embedding = true WHERE id = $1 AND embedding IS NULL',
+          [id]
+        );
+      }
+
+      await client.query('COMMIT');
+
+      const msg = embeddingSuccess
+        ? `Captured ${metadata.type || "observation"} — stored with embedding.`
+        : `Captured ${metadata.type || "observation"} — embedding staged for later (Ollama unavailable).`;
+
+      return { content: [{ type: "text", text: msg }] };
     } catch (err) {
+      await client.query('ROLLBACK');
       return { content: [{ type: "text", text: `Failed to capture thought: ${err.message}` }] };
+    } finally {
+      client.release();
     }
-
-    const { id } = upsertResult.rows[0];
-
-    let embeddingSuccess = false;
-    try {
-      const embedding = await getEmbedding(content, config.ollama_url);
-      await pgPool.query(
-        'UPDATE thoughts SET embedding = $1, needs_embedding = false WHERE id = $2',
-        [embedding, id]
-      );
-      embeddingSuccess = true;
-    } catch {
-      await pgPool.query(
-        'UPDATE thoughts SET needs_embedding = true WHERE id = $1 AND embedding IS NULL',
-        [id]
-      );
-    }
-
-    const msg = embeddingSuccess
-      ? `Captured ${metadata.type || "observation"} — stored with embedding.`
-      : `Captured ${metadata.type || "observation"} — embedding staged for later (Ollama unavailable).`;
-
-    return { content: [{ type: "text", text: msg }] };
   }
 );
 

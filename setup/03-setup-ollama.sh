@@ -44,10 +44,10 @@ main() {
 
     echo "Pulling models..."
     ollama pull nomic-embed-text
-    ollama pull llama3.2-mini
+    ollama pull llama3.2-mini:Q2_K
 
     echo "Verifying models..."
-    ollama list | grep -E "(nomic-embed-text|llama3.2-mini)" || echo "Warning: models may still be downloading"
+    ollama list | grep -E "(nomic-embed-text|llama3.2-mini:Q2_K)" || echo "Warning: models may still be downloading"
 
     echo ""
     echo "Ollama setup complete. Verify with: openbrain doctor"

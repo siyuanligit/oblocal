@@ -85,21 +85,21 @@ docker compose exec postgres psql -U postgres -d openbrain -c '\dt'
 Ollama runs AI models locally — no external API calls needed. We pull two models:
 
 - **`nomic-embed-text`** — generates the 1536-dimensional embedding vectors for semantic search
-- **`llama3.2-mini`** — extracts metadata from captured thoughts (type, topics, people, action items)
+- **`llama3.2-mini:Q2_K`** — extracts metadata from captured thoughts (type, topics, people, action items). Default Q2_K quantized with safe fallback validation.
 
 **macOS / Linux:**
 
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
 ollama pull nomic-embed-text
-ollama pull llama3.2-mini
+ollama pull llama3.2-mini:Q2_K
 ```
 
 **Windows:** Download Ollama from [ollama.com](https://ollama.com), then in PowerShell:
 
 ```powershell
 ollama pull nomic-embed-text
-ollama pull llama3.2-mini
+ollama pull llama3.2-mini:Q2_K
 ```
 
 Verify both models are available:
@@ -108,7 +108,7 @@ Verify both models are available:
 ollama list
 ```
 
-✅ **Done when:** `ollama list` shows both `nomic-embed-text` and `llama3.2-mini` in the model list.
+✅ **Done when:** `ollama list` shows both `nomic-embed-text` and `llama3.2-mini:Q2_K` in the model list.
 
 ---
 
@@ -130,11 +130,30 @@ openbrain init
   "database_url": "postgresql://postgres:openbrain@localhost:5432/openbrain",
   "ollama_url": "http://localhost:11434",
   "embedding_model": "nomic-embed-text",
-  "chat_model": "llama3.2-mini"
+  "chat_model": "llama3.2-mini:Q2_K"
 }
 ```
 
 Re-run `openbrain init` any time to update the configuration.
+
+### Quantization Upgrades
+
+Default is `Q2_K` (~1GB). For better metadata quality, upgrade the chat model:
+
+| Quantization | Size | Quality | Notes |
+|---|---|---|---|
+| `Q2_K` | ~1GB | Baseline | Default — safe with validation |
+| `Q3_K_M` | ~1.4GB | Better | Moderate improvement |
+| `Q4_K_M` | ~2GB | Best | Recommended upgrade path |
+
+**To upgrade:**
+```bash
+ollama pull llama3.2-mini:Q4_K_M
+# Then edit ~/.openbrain/config.json → "chat_model": "llama3.2-mini:Q4_K_M"
+openbrain doctor --json
+```
+
+All variants use the same `safeExtractMetadata` validation — malformed JSON falls back safely regardless of quantization level.
 
 ✅ **Done when:** `openbrain --version` prints the version without errors.
 
@@ -237,7 +256,7 @@ What did I capture about Sarah?
 |---|---|---|
 | **Database** | Hosted PostgreSQL | Local Docker container |
 | **Embedding** | OpenRouter API call | Local Ollama (`nomic-embed-text`) |
-| **Metadata extraction** | GPT-4o-mini via OpenRouter | Local Ollama (`llama3.2-mini`, configurable) |
+| **Metadata extraction** | GPT-4o-mini via OpenRouter | Local Ollama (`llama3.2-mini:Q2_K`, configurable) |
 | **Auth** | Access key in URL/header | None (localhost stdio) |
 | **MCP transport** | StreamableHTTP (cloud Edge Function) | Stdio over Docker |
 | **MCP server startup** | `supabase functions deploy` | `docker run` (always-on container) |
