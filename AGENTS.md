@@ -142,3 +142,18 @@ In `~/.claude/mcp.json`:
 **Ollama models:** `nomic-embed-text` (embeddings) + `llama3.2-mini:Q2_K` (metadata). Both required.
 
 **Quantization upgrade:** `ollama pull llama3.2-mini:Q4_K_M` → update `chat_model` in config. `safeExtractMetadata` validates all variants.
+
+## Commit Convention
+
+Format: `<type>: <description>` — lowercase, imperative, no period.
+
+| Type | Use for |
+|---|---|
+| `feat` | new capability or user-visible behavior |
+| `fix` | bug fix |
+| `refactor` | restructuring with no behavior change |
+| `chore` | tooling, config, gitignore, scripts |
+| `docs` | documentation only |
+| `test` | test additions or fixes |
+
+Keep descriptions short and specific — say what changed and why it matters, not which files were touched.
